@@ -49,6 +49,24 @@ def num(m, *keys):
             except (TypeError, ValueError): pass
     return None
 
+def timestamp_seconds(m, *keys):
+    """Accept Kalshi timestamps represented as epoch numbers or ISO-8601 strings."""
+    for key in keys:
+        value = m.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            try:
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except (TypeError, ValueError):
+                continue
+    return None
+
 def ask_price(m, side):
     # Prefer a directly supplied ask. If absent, infer binary ask from the opposing bid:
     # YES ask = 1 - NO bid; NO ask = 1 - YES bid.
@@ -75,9 +93,9 @@ def build_signal(market, candles):
     sigma = max(sigma, 0.00008)
 
     strike = num(market, "floor_strike", "strike_price", "floor_strike_dollars")
-    close_ts = num(market, "close_ts", "expiration_ts")
+    close_ts = timestamp_seconds(market, "close_ts", "close_time", "expiration_ts", "expiration_time", "expected_expiration_time")
     now_ts = datetime.now(timezone.utc).timestamp()
-    secs_left = max(0, int(close_ts-now_ts)) if close_ts else None
+    secs_left = max(0, int(close_ts-now_ts)) if close_ts is not None else None
     mins_left = max(0.25, (secs_left or 900)/60)
 
     # A transparent heuristic score combines multi-horizon momentum and distance to strike.
@@ -113,7 +131,7 @@ try:
         st.warning("No open KXBTC15M market was returned. Try refreshing, or check Kalshi's BTC 15-minute market page.")
         st.stop()
     # Prefer market with the latest close time among currently open markets.
-    market = max(markets, key=lambda m: num(m, "close_ts") or 0)
+    market = max(markets, key=lambda m: timestamp_seconds(m, "close_ts", "close_time", "expiration_ts", "expiration_time", "expected_expiration_time") or 0)
     candles = get_candles()
     s = build_signal(market, candles)
 except Exception as e:
@@ -129,7 +147,15 @@ st.subheader("Current signal")
 action = s["action"]
 if action == "UP": st.success("UP signal — heuristic only")
 elif action == "DOWN": st.error("DOWN signal — heuristic only")
-else: st.warning("NO TRADE — insufficient estimated edge or missing price")
+else:
+    reasons = []
+    if s["prob"] < min_conf:
+        reasons.append(f"directional probability {s['prob']:.1%} is below your {min_conf:.0%} filter")
+    if s["ask"] is None:
+        reasons.append("Kalshi ask price is unavailable")
+    elif s["edge"] is not None and s["edge"] < min_edge:
+        reasons.append(f"estimated edge {s['edge']:.1%} is below your {min_edge:.1%} filter")
+    st.warning("NO TRADE — " + ("; ".join(reasons) if reasons else "filters not met"))
 
 c1,c2,c3 = st.columns(3)
 c1.metric("Estimated UP probability", f"{s['p_up']:.1%}")
@@ -144,6 +170,8 @@ st.write("**UP (YES) ask:**", f"${s['yes_ask']:.2f}" if s['yes_ask'] is not None
 st.write("**DOWN (NO) ask:**", f"${s['no_ask']:.2f}" if s['no_ask'] is not None else "Unavailable")
 st.write("**Momentum:**", f"1m {s['r1']:+.3%} · 3m {s['r3']:+.3%} · 5m {s['r5']:+.3%}")
 st.caption("BTC spot is from Coinbase and may differ from the CF Benchmarks index used for settlement. Verify the exact market rules and displayed order book on Kalshi.")
+if s["secs_left"] is None:
+    st.info("The market API did not provide a recognized close/expiration timestamp, so time left is unknown. This does not mean the market has no expiry; check the Kalshi market details.")
 
 st.subheader("Suggested price discipline")
 if s['prob'] is not None:
